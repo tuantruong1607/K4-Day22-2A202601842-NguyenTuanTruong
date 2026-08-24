@@ -1,0 +1,14 @@
+{
+  "train_runtime": 1084.2,
+  "train_samples_per_second": 1.84,
+  "train_steps_per_second": 0.115,
+  "total_flos": 4.12e16,
+  "train_loss": 0.4215,
+  "epoch": 1.0,
+  "step": 125,
+  "end_reward_gap": 1.382,
+  "end_chosen_reward": 0.324,
+  "end_rejected_reward": -1.058,
+  "mean_output_length_sft": 148,
+  "mean_output_length_dpo": 94
+}
