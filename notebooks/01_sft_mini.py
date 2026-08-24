@@ -41,8 +41,12 @@ else:  # BIGGPU
     PER_DEVICE_BATCH = 2
     GRAD_ACCUM = 4
 
-SFT_DATASET = os.environ.get("SFT_DATASET", "5CD-AI/Vietnamese-alpaca-cleaned")
-SFT_SLICE = 1000
+SFT_DATASET = os.environ.get(
+    "SFT_DATASET",
+    "5CD-AI/Vietnamese-alpaca-gpt4-gg-translated",
+)
+SFT_SLICE = int(os.environ.get("SFT_SLICE", "1000"))
+SEED = int(os.environ.get("SEED", "42"))
 NUM_EPOCHS = 1
 
 REPO_ROOT = Path.cwd().parent if Path.cwd().name == "notebooks" else Path.cwd()
@@ -52,6 +56,7 @@ ADAPTER_OUT.mkdir(parents=True, exist_ok=True)
 print(f"COMPUTE_TIER:    {COMPUTE_TIER}")
 print(f"BASE_MODEL:      {BASE_MODEL}")
 print(f"SFT_DATASET:     {SFT_DATASET}  (slice: {SFT_SLICE})")
+print(f"SEED:            {SEED}")
 print(f"max_seq_length:  {MAX_LEN}")
 print(f"effective batch: {PER_DEVICE_BATCH * GRAD_ACCUM}")
 print(f"output:          {ADAPTER_OUT}")
@@ -104,18 +109,77 @@ model = FastLanguageModel.get_peft_model(
 print(f"Trainable params: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
 
 # %% [markdown]
-# ## 2. Load + format VN Alpaca slice
+# ## 2. Load + audit + format VN Alpaca slice
 #
-# `5CD-AI/Vietnamese-alpaca-cleaned` is a 50k-row VN Alpaca translation. Lab 21
-# uses 1k slice for the demo run; we match that exactly so reward gap is comparable.
-
+# The selected dataset has bilingual column names. Normalize the Vietnamese
+# instruction/input/output fields before applying Qwen's chat template.
 # %%
 from datasets import load_dataset
 
-ds = load_dataset(SFT_DATASET, split=f"train[:{SFT_SLICE}]")
-print(f"Loaded {len(ds)} rows. Columns: {ds.column_names}")
-print(f"\nFirst row:\n{ds[0]}")
+raw_ds = load_dataset(SFT_DATASET, split="train")
+raw_count = len(raw_ds)
+required_columns = {"instruction_vi", "input_vi", "output_vi"}
+missing_columns = required_columns.difference(raw_ds.column_names)
+assert not missing_columns, (
+    f"SFT dataset is missing expected Vietnamese columns: {sorted(missing_columns)}. "
+    f"Available columns: {raw_ds.column_names}"
+)
 
+raw_ds = raw_ds.filter(
+    lambda row: bool((row.get("instruction_vi") or "").strip())
+    and bool((row.get("output_vi") or "").strip())
+)
+filtered_count = len(raw_ds)
+raw_ds = raw_ds.shuffle(seed=SEED)
+raw_ds = raw_ds.select(range(min(SFT_SLICE, len(raw_ds))))
+
+
+def normalize_vietnamese_alpaca(row):
+    return {
+        "instruction": row["instruction_vi"].strip(),
+        "input": (row.get("input_vi") or "").strip(),
+        "output": row["output_vi"].strip(),
+    }
+
+
+ds = raw_ds.map(
+    normalize_vietnamese_alpaca,
+    remove_columns=raw_ds.column_names,
+)
+
+print(f"Loaded {raw_count} rows from {SFT_DATASET}")
+print(f"Rows after instruction/output filter: {filtered_count}")
+print(f"Selected examples: {len(ds)}  (seed={SEED})")
+print(f"Columns after normalization: {ds.column_names}")
+
+empty_input_pct = 100 * sum(not row["input"] for row in ds) / max(len(ds), 1)
+instruction_lengths = [len(row["instruction"]) for row in ds]
+output_lengths = [len(row["output"]) for row in ds]
+duplicate_pairs = len(ds) - len({(row["instruction"], row["output"]) for row in ds})
+
+import numpy as np
+
+
+def describe_lengths(values):
+    return {
+        "min": int(np.min(values)),
+        "median": float(np.median(values)),
+        "p95": float(np.percentile(values, 95)),
+        "max": int(np.max(values)),
+    }
+
+
+print(f"Empty input ratio: {empty_input_pct:.1f}%")
+print(f"Instruction character lengths: {describe_lengths(instruction_lengths)}")
+print(f"Output character lengths:      {describe_lengths(output_lengths)}")
+print(f"Duplicate instruction/output pairs: {duplicate_pairs}")
+
+print("\nQuality-audit samples (inspect at least 20 manually in the notebook output):")
+for i in range(min(3, len(ds))):
+    print(f"\n────── Audit sample {i + 1} ──────")
+    print(f"INSTRUCTION: {ds[i]['instruction']}")
+    print(f"INPUT:       {ds[i]['input'] or '[empty]'}")
+    print(f"OUTPUT:      {ds[i]['output']}")
 # %%
 # Alpaca → ChatML format (Qwen2.5's native template)
 def format_alpaca_to_chat(row):
